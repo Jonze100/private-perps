@@ -1,120 +1,70 @@
-# Structure of this project
+# Private Perps
 
-This project is structured pretty similarly to how a regular Solana Anchor project is structured. The main difference lies in there being two places to write code here:
+A privacy-preserving perpetuals trading protocol on Solana, powered by [Arcium](https://arcium.com) MPC/FHE.
 
-- The `programs` dir like usual Anchor programs
-- The `encrypted-ixs` dir for confidential computing instructions
+Position data — size, direction, entry price, collateral, and owner — is **always encrypted on-chain**. The Arcium network handles all state transitions as a confidential co-processor: liquidation checks reveal only a boolean, and PnL is revealed only to the position owner at close.
 
-When working with plaintext data, we can edit it inside our program as normal. When working with confidential data though, state transitions take place off-chain using the Arcium network as a co-processor. For this, we then always need two instructions in our program: one that gets called to initialize a confidential computation, and one that gets called when the computation is done and supplies the resulting data. Additionally, since the types and operations in a Solana program and in a confidential computing environment are a bit different, we define the operations themselves in the `encrypted-ixs` dir using our Rust-based framework called Arcis. To link all of this together, we provide a few macros that take care of ensuring the correct accounts and data are passed for the specific initialization and callback functions:
+## How it works
 
+Arcium acts as an off-chain co-processor for encrypted state. Every confidential operation follows the same pattern:
+
+1. The Solana program queues a computation with encrypted inputs
+2. Arcium's MPC nodes execute the circuit over the ciphertext
+3. The result is posted back via a callback instruction
+
+Encrypted circuits live in `encrypted-ixs/src/lib.rs` (written in Arcis). The Anchor program in `programs/private_perps/src/lib.rs` handles the queue and callback instructions.
+
+## Circuits
+
+| Circuit | Input | Output |
+|---|---|---|
+| `open_position` | Encrypted `Position` | Re-encrypted `Position` (stored on-chain) |
+| `compute_pnl` | Encrypted `Position` + mark price | Encrypted `i64` (only trader can decrypt) |
+| `check_liquidation` | Encrypted `Position` + mark price | Public `bool` |
+| `close_position` | Encrypted `Position` + mark price | Encrypted `i64` PnL (only trader can decrypt) |
+
+The `Position` struct:
 ```rust
-// encrypted-ixs/add_together.rs
-
-use arcis::*;
-
-#[encrypted]
-mod circuits {
-    use arcis::*;
-
-    pub struct InputValues {
-        v1: u8,
-        v2: u8,
-    }
-
-    #[instruction]
-    pub fn add_together(input_ctxt: Enc<Shared, InputValues>) -> Enc<Shared, u16> {
-        let input = input_ctxt.to_arcis();
-        let sum = input.v1 as u16 + input.v2 as u16;
-        input_ctxt.owner.from_arcis(sum)
-    }
-}
-
-// programs/my_program/src/lib.rs
-
-use anchor_lang::prelude::*;
-use arcium_anchor::prelude::*;
-
-declare_id!("<some ID>");
-
-#[arcium_program]
-pub mod my_program {
-    use super::*;
-
-    pub fn init_add_together_comp_def(ctx: Context<InitAddTogetherCompDef>) -> Result<()> {
-        init_comp_def(ctx.accounts, None, None)?;
-        Ok(())
-    }
-
-    pub fn add_together(
-        ctx: Context<AddTogether>,
-        computation_offset: u64,
-        ciphertext_0: [u8; 32],
-        ciphertext_1: [u8; 32],
-        pubkey: [u8; 32],
-        nonce: u128,
-    ) -> Result<()> {
-        ctx.accounts.sign_pda_account.bump = ctx.bumps.sign_pda_account;
-        let args = ArgBuilder::new()
-            .x25519_pubkey(pubkey)
-            .plaintext_u128(nonce)
-            .encrypted_u8(ciphertext_0)
-            .encrypted_u8(ciphertext_1)
-            .build();
-
-        queue_computation(
-            ctx.accounts,
-            computation_offset,
-            args,
-            vec![AddTogetherCallback::callback_ix(
-                computation_offset,
-                &ctx.accounts.mxe_account,
-                &[]
-            )?],
-            1,
-            0,
-        )?;
-        Ok(())
-    }
-
-    #[arcium_callback(encrypted_ix = "add_together")]
-    pub fn add_together_callback(
-        ctx: Context<AddTogetherCallback>,
-        output: SignedComputationOutputs<AddTogetherOutput>,
-    ) -> Result<()> {
-        let o = match output.verify_output(&ctx.accounts.cluster_account, &ctx.accounts.computation_account) {
-            Ok(AddTogetherOutput { field_0 }) => field_0,
-            Err(_) => return Err(ErrorCode::AbortedComputation.into()),
-        };
-
-        emit!(SumEvent {
-            sum: o.ciphertexts[0],
-            nonce: o.nonce.to_le_bytes(),
-        });
-        Ok(())
-    }
-}
-
-#[queue_computation_accounts("add_together", payer)]
-#[derive(Accounts)]
-#[instruction(computation_offset: u64)]
-pub struct AddTogether<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
-}
-
-#[callback_accounts("add_together")]
-#[derive(Accounts)]
-pub struct AddTogetherCallback<'info> {
-    // ... required accounts
-    pub some_extra_acc: AccountInfo<'info>,
-}
-
-#[init_computation_definition_accounts("add_together", payer)]
-#[derive(Accounts)]
-pub struct InitAddTogetherCompDef<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-    // ... other required accounts
+pub struct Position {
+    size: u64,
+    is_long: bool,
+    entry_price: u64,
+    collateral: u64,
+    owner: u128,
+    is_open: bool,
 }
 ```
+
+Liquidation triggers when `loss * 1.1 >= collateral` (10% maintenance margin).
+
+## Project structure
+
+```
+programs/private_perps/src/lib.rs   # Anchor program (queue + callback instructions)
+encrypted-ixs/src/lib.rs            # Arcis circuits (confidential computation logic)
+tests/private_perps.ts              # Integration tests
+```
+
+## Running tests
+
+```bash
+export PATH="$HOME/bin:$HOME/.cargo/bin:$HOME/.local/share/solana/install/active_release/bin:$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
+arcium test
+```
+
+Expected output:
+```
+  private_perps
+    ✔ inits all computation definitions
+    ✔ opens a private position
+    ✔ checks liquidation (should return false at entry price)
+    ✔ closes position and reveals PnL
+
+  4 passing
+```
+
+## Dependencies
+
+- [Anchor](https://www.anchor-lang.com/) 0.32.1
+- [Arcium](https://docs.arcium.com) SDK + CLI
+- Solana 2.3.0
